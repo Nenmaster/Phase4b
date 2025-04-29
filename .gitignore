@@ -1,0 +1,12 @@
+test*
+*.in
+*.out
+*.o
+run_testcases.student
+.DS_Store  
+disk0
+disk1
+libphase1.a
+libphase2.a
+libphase3.a
+
