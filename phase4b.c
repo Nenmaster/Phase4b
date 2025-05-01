@@ -311,7 +311,6 @@ int DiskDriver(void *arg) {
   trackReq.reg2 = NULL;
 
   USLOSS_DeviceOutput(USLOSS_DISK_DEV, unit, &trackReq);
-
   status = waitDiskInterrupt(unit);
 
   if (status == USLOSS_DEV_READY) {
@@ -328,126 +327,147 @@ int DiskDriver(void *arg) {
       MboxRecv(diskMailbox[unit], &dummy, sizeof(int));
       continue;
     }
+
     DiskRequest *req = getNextDiskRequest(unit);
     if (req == NULL) {
       printf("[DEBUG] DiskDriver(%d): Got NULL request after signal\n", unit);
       continue;
     }
 
-    // If we need to seek, do it
-    if (req->track != diskHeadPosition[unit]) {
-      if (req->track < 0 || req->track >= diskInfo[unit][2]) {
-        USLOSS_Console("ERROR: Invalid track number %d for unit %d\n",
-                       req->track, unit);
-        continue; // Skip this request
-      }
-
-      USLOSS_DeviceRequest seek;
-      seek.opr = USLOSS_DISK_SEEK;
-      seek.reg1 = (void *)(long)(req->track);
-      seek.reg2 = NULL;
-
-      USLOSS_DeviceOutput(USLOSS_DISK_DEV, unit, &seek);
-      status = waitDiskInterrupt(unit);
-
-      // Update head position
-      diskHeadPosition[unit] = req->track;
-    }
-
-    // Execute the request
     if (req->buffer == NULL) {
       req->status = -1;
       unblockProc(req->pid);
-
       kernSemV(diskSemaphores[req->unit]);
-
       free(req);
       continue;
     }
 
     if (req->opType == 1) { // WRITE
-      void *kernelBuf = malloc(req->sectors * diskInfo[unit][0]);
-      if (kernelBuf == NULL) {
-        USLOSS_Console("DiskDriver(%d): malloc failed for WRITE\n", unit);
-        req->status = -1;
-        unblockProc(req->pid);
-        continue;
+      int remaining = req->sectors;
+      int currTrack = req->track;
+      int currSector = req->first;
+      char *src = req->buffer;
+
+      while (remaining > 0) {
+        int space = diskInfo[unit][1] - currSector;
+        int toWrite = (remaining < space) ? remaining : space;
+
+        if (diskHeadPosition[unit] != currTrack) {
+          USLOSS_DeviceRequest seek;
+          seek.opr = USLOSS_DISK_SEEK;
+          seek.reg1 = (void *)(long)currTrack;
+          seek.reg2 = NULL;
+          USLOSS_DeviceOutput(USLOSS_DISK_DEV, unit, &seek);
+          waitDiskInterrupt(unit);
+          diskHeadPosition[unit] = currTrack;
+        }
+
+        void *kernelBuf = malloc(toWrite * diskInfo[unit][0]);
+        if (!kernelBuf) {
+          USLOSS_Console("DiskDriver(%d): malloc failed for WRITE\n", unit);
+          req->status = -1;
+          unblockProc(req->pid);
+          kernSemV(diskSemaphores[req->unit]);
+          free(req);
+          continue;
+        }
+
+        memcpy(kernelBuf, src, toWrite * diskInfo[unit][0]);
+
+        USLOSS_DeviceRequest write;
+        write.opr = USLOSS_DISK_WRITE;
+        write.reg1 = (void *)(long)currSector;
+        write.reg2 = kernelBuf;
+
+        int result = USLOSS_DeviceOutput(USLOSS_DISK_DEV, req->unit, &write);
+        if (result != USLOSS_DEV_OK) {
+          USLOSS_Console("[ERROR] Disk WRITE failed (unit %d, track %d)\n",
+                         req->unit, currTrack);
+        }
+
+        status = waitDiskInterrupt(unit);
+        free(kernelBuf);
+
+        remaining -= toWrite;
+        src += toWrite * diskInfo[unit][0];
+        currSector = 0;
+        currTrack++;
       }
 
-      memcpy(kernelBuf, req->buffer, req->sectors * diskInfo[unit][0]);
-
-      USLOSS_DeviceRequest write;
-      write.opr = USLOSS_DISK_WRITE;
-      write.reg1 = (void *)(long)req->first;
-      write.reg2 = kernelBuf;
-
-      int result = USLOSS_DeviceOutput(USLOSS_DISK_DEV, req->unit, &write);
-      if (result != USLOSS_DEV_OK) {
-        USLOSS_Console(
-            "[ERROR] Disk WRITE failed: USLOSS_DeviceOutput returned %d\n",
-            result);
-        USLOSS_Console("         unit=%d, track=%d, sector=%d, sectors=%d\n",
-                       req->unit, req->track, req->first, req->sectors);
-      }
-
-      status = waitDiskInterrupt(unit);
-
-      free(kernelBuf);
       req->status = status;
       kernSemV(diskSemaphores[unit]);
+      unblockProc(req->pid);
+      free(req);
+      continue;
     }
 
     if (req->opType == 0) { // READ
-      void *kernelBuf = malloc(req->sectors * diskInfo[unit][0]);
-      if (kernelBuf == NULL) {
-        USLOSS_Console("DiskDriver(%d): malloc failed for READ\n", unit);
-        req->status = -1;
-        unblockProc(req->pid);
-        continue;
+      int remaining = req->sectors;
+      int currTrack = req->track;
+      int currSector = req->first;
+      char *dest = req->buffer;
+
+      while (remaining > 0) {
+        int space = diskInfo[unit][1] - currSector;
+        int toRead = (remaining < space) ? remaining : space;
+
+        if (diskHeadPosition[unit] != currTrack) {
+          USLOSS_DeviceRequest seek;
+          seek.opr = USLOSS_DISK_SEEK;
+          seek.reg1 = (void *)(long)currTrack;
+          seek.reg2 = NULL;
+          USLOSS_DeviceOutput(USLOSS_DISK_DEV, unit, &seek);
+          waitDiskInterrupt(unit);
+          diskHeadPosition[unit] = currTrack;
+        }
+
+        void *kernelBuf = malloc(toRead * diskInfo[unit][0]);
+        if (!kernelBuf) {
+          USLOSS_Console("DiskDriver(%d): malloc failed for READ\n", unit);
+          req->status = -1;
+          unblockProc(req->pid);
+          kernSemV(diskSemaphores[req->unit]);
+          free(req);
+          continue;
+        }
+
+        USLOSS_DeviceRequest read;
+        read.opr = USLOSS_DISK_READ;
+        read.reg1 = (void *)(long)currSector;
+        read.reg2 = kernelBuf;
+
+        int result = USLOSS_DeviceOutput(USLOSS_DISK_DEV, req->unit, &read);
+        if (result != USLOSS_DEV_OK) {
+          USLOSS_Console("[ERROR] Disk READ failed (unit %d, track %d)\n",
+                         req->unit, currTrack);
+        }
+
+        status = waitDiskInterrupt(unit);
+        memcpy(dest, kernelBuf, toRead * diskInfo[unit][0]);
+        free(kernelBuf);
+
+        remaining -= toRead;
+        dest += toRead * diskInfo[unit][0];
+        currSector = 0;
+        currTrack++;
       }
 
-      USLOSS_DeviceRequest read;
-      read.opr = USLOSS_DISK_READ;
-      read.reg1 = (void *)(long)req->first;
-      read.reg2 = kernelBuf;
-
-      int result = USLOSS_DeviceOutput(USLOSS_DISK_DEV, req->unit, &read);
-      if (result != USLOSS_DEV_OK) {
-        USLOSS_Console(
-            "[ERROR] Disk WRITE failed: USLOSS_DeviceOutput returned %d\n",
-            result);
-        USLOSS_Console("         unit=%d, track=%d, sector=%d, sectors=%d\n",
-                       req->unit, req->track, req->first, req->sectors);
-      }
-
-      status = waitDiskInterrupt(unit);
-
-      memcpy(req->buffer, kernelBuf, req->sectors * diskInfo[unit][0]);
-      free(kernelBuf);
       req->status = status;
       kernSemV(diskSemaphores[unit]);
+      unblockProc(req->pid);
+      free(req);
+      continue;
     }
 
+    // Catch-all fallback
+    USLOSS_Console("[ERROR] Unknown opType = %d in DiskDriver\n", req->opType);
+    req->status = -1;
+    kernSemV(diskSemaphores[unit]);
     unblockProc(req->pid);
-
-    // After finishing this request, check if we need to reset head position
-    if (diskQueue[unit] != NULL &&
-        diskQueue[unit]->position >= diskInfo[unit][2]) {
-      // We have requests for the next sweep, reset head position
-      diskHeadPosition[unit] = 0;
-
-      // Adjust all request positions
-      DiskRequest *curr = diskQueue[unit];
-      while (curr != NULL) {
-        if (curr->position >= diskInfo[unit][2]) {
-          curr->position -= diskInfo[unit][2];
-        }
-        curr = curr->next;
-      }
-    }
+    free(req);
   }
 
-  return 0;
+  return 0; // never reached
 }
 
 void diskSizeHandler(USLOSS_Sysargs *args) {
@@ -493,7 +513,7 @@ void diskReadHandler(USLOSS_Sysargs *args) {
     return;
   }
 
-  if (first < 0 || first + sectors > diskInfo[unit][1]) {
+  if (first < 0 || first >= diskInfo[unit][1]) {
     printf("DISKREADHANDLER failed check\n");
     args->arg4 = (void *)(long)-1;
     return;
@@ -517,7 +537,6 @@ void diskReadHandler(USLOSS_Sysargs *args) {
 
   args->arg1 = (void *)(long)req->status;
   args->arg4 = (void *)(long)0;
-  free(req);
 }
 
 void diskWriteHandler(USLOSS_Sysargs *args) {
@@ -549,7 +568,7 @@ void diskWriteHandler(USLOSS_Sysargs *args) {
     return;
   }
 
-  if (first < 0 || first + sectors > diskInfo[unit][1]) {
+  if (first < 0 || first >= diskInfo[unit][1]) {
     printf("DISKWIRTEHANDLER failed check\n");
     args->arg4 = (void *)(long)-1;
     return;
@@ -572,12 +591,12 @@ void diskWriteHandler(USLOSS_Sysargs *args) {
 
   args->arg1 = (void *)(long)req->status;
   args->arg4 = (void *)(long)0;
-  free(req);
 }
 
 // Helpers
 
-// Inserts a new sleep request into the queue in ascending order by wakeup time
+// Inserts a new sleep request into the queue in ascending order by wakeup
+// time
 void enqueueSleepEntry(int pid, int wakeupTime) {
   SleepEntry *newReq = malloc(sizeof(SleepEntry));
   newReq->pid = pid;
@@ -598,8 +617,8 @@ void enqueueSleepEntry(int pid, int wakeupTime) {
   curr->next = newReq;
 }
 
-// Unblocks and removes all processes from the sleep queue whose wakeup time has
-// passed
+// Unblocks and removes all processes from the sleep queue whose wakeup time
+// has passed
 void wakeUpProc() {
   while (sleepEntryQueue && sleepEntryQueue->wakeupTime <= clockTickCounter) {
     SleepEntry *tmp = sleepEntryQueue;
