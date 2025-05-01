@@ -303,7 +303,7 @@ int DiskDriver(void *arg) {
   diskInfo[unit][0] = 512;    // sector size
   diskInfo[unit][1] = 16;     // sectors per track
   diskHeadPosition[unit] = 0; // Start at track 0
-                              //
+
   // Get number of tracks
   USLOSS_DeviceRequest trackReq;
   trackReq.opr = USLOSS_DISK_TRACKS;
@@ -323,15 +323,11 @@ int DiskDriver(void *arg) {
   }
 
   while (1) {
-    // Wait for a request if queue is empty
-    //
     if (diskQueue[unit] == NULL) {
       int dummy;
       MboxRecv(diskMailbox[unit], &dummy, sizeof(int));
       continue;
     }
-
-    // Get the next request
     DiskRequest *req = getNextDiskRequest(unit);
     if (req == NULL) {
       printf("[DEBUG] DiskDriver(%d): Got NULL request after signal\n", unit);
@@ -480,6 +476,11 @@ void diskReadHandler(USLOSS_Sysargs *args) {
   int first = (int)(long)args->arg4;
   int unit = (int)(long)args->arg5;
 
+  if (!diskReady[unit]) {
+    int dummy;
+    MboxRecv(diskReadyMbox[unit], &dummy, sizeof(int));
+  }
+
   if (!buffer || sectors <= 0 || unit < 0 || unit >= NUM_DISKS) {
     printf("DISKREADHANDLER failed check\n");
     args->arg4 = (void *)(long)-1;
@@ -526,9 +527,14 @@ void diskWriteHandler(USLOSS_Sysargs *args) {
   int first = (int)(long)args->arg4;
   int unit = (int)(long)args->arg5;
 
+  if (!diskReady[unit]) {
+    int dummy;
+    MboxRecv(diskReadyMbox[unit], &dummy, sizeof(int));
+  }
+
   if (buffer == NULL) {
     printf("ERROR: buffer is NULL in diskWriteHandler\n");
-    return -1;
+    return;
   }
 
   if (!buffer || sectors <= 0 || unit < 0 || unit >= NUM_DISKS) {
