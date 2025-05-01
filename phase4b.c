@@ -13,6 +13,7 @@
 #include <phase3.h>
 #include <phase3_kernelInterfaces.h>
 #include <phase4.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -65,6 +66,8 @@ int diskMailbox[NUM_DISKS];
 int diskInfo[NUM_DISKS][3];
 int diskHeadPosition[NUM_DISKS];
 int diskSemaphores[NUM_DISKS];
+bool diskReady[NUM_DISKS] = {false};
+int diskReadyMbox[NUM_DISKS];
 
 // ProtoTypes
 void enqueueSleepEntry(int pid, int wakeupTime);
@@ -128,6 +131,7 @@ void phase4_init(void) {
 
   for (int i = 0; i < NUM_DISKS; i++) {
     diskMailbox[i] = MboxCreate(10, sizeof(int));
+    diskReadyMbox[i] = MboxCreate(1, sizeof(int));
     diskQueue[i] = NULL;
     diskHeadPosition[i] = 0;
     int semId;
@@ -310,6 +314,14 @@ int DiskDriver(void *arg) {
 
   status = waitDiskInterrupt(unit);
 
+  if (status == USLOSS_DEV_READY) {
+    diskReady[unit] = true;
+    int dummy = 1;
+    MboxSend(diskReadyMbox[unit], &dummy, sizeof(int));
+  } else {
+    diskReady[unit] = false;
+  }
+
   while (1) {
     // Wait for a request if queue is empty
     //
@@ -450,14 +462,9 @@ void diskSizeHandler(USLOSS_Sysargs *args) {
     return;
   }
 
-  // Set fixed values that we know
-  diskInfo[unit][0] = 512; // sector size (always 512 bytes)
-  diskInfo[unit][1] = 16;  // sectors per track (always 16)
-
-  // If the tracks aren't initialized yet, use a reasonable default
-  if (diskInfo[unit][2] == 0) {
-    // We can just use a default value temporarily
-    diskInfo[unit][2] = 16; // Default track count
+  if (!diskReady[unit]) {
+    int dummy;
+    MboxRecv(diskReadyMbox[unit], &dummy, sizeof(int));
   }
 
   args->arg1 = (void *)(long)diskInfo[unit][0];
@@ -658,6 +665,5 @@ int waitDiskInterrupt(int unit) {
   int status;
 
   int result = MboxRecv(diskMailbox[unit], &status, sizeof(int));
-
   return (result == sizeof(int)) ? status : -1;
 }
