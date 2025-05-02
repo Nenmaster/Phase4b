@@ -1,10 +1,13 @@
 /*
  *
  *Programmers: Omar Mendivil & Ayman Mohamed
- *Phase4a
+ *Phase4b
  * Implements kernel side handlers for Sleep(), TermRead(), and TermWrite()
  * using clock and terminal device drivers.
  *
+ * Part B introduces DiskSize, DiskRead and DiskWrite device drivers
+ * and uses C-SCAN scheduling algorithm and async handling of disk I/O
+ * through mailbox bases communication with DiskDriver
  * */
 
 #include <phase1.h>
@@ -29,7 +32,6 @@ typedef struct SleepEntry {
   struct SleepEntry *next;
 } SleepEntry;
 
-///// NEW STRUCT ADDED FOR 4B////////
 typedef struct DiskRequest {
   int opType;
   void *buffer;
@@ -61,13 +63,12 @@ int writeWaiting[4];
 char lineBuff[4][MAXLINE];
 int lineLen[4];
 
-/// NEW STUFF ADDED FOR 4B ///////
 DiskRequest *diskQueue[NUM_DISKS];
 int diskRequestMbox[NUM_DISKS];
 int diskInterruptMbox[NUM_DISKS];
 int diskData[NUM_DISKS][3];
 int currTrackPos[NUM_DISKS];
-int diskSemaphores[NUM_DISKS];
+int diskSemLocks[NUM_DISKS];
 bool diskReady[NUM_DISKS] = {false};
 int diskReadyMbox[NUM_DISKS];
 
@@ -80,8 +81,6 @@ void sleepHandler(USLOSS_Sysargs *args);
 void termWriteHandler(USLOSS_Sysargs *args);
 void termReadHandler(USLOSS_Sysargs *args);
 void termHandler(int type, void *arg);
-
-//////// NWEW STUFF ADDED FOR 4B ////////
 int DiskDriver(void *arg);
 void diskSizeHandler(USLOSS_Sysargs *args);
 void diskReadHandler(USLOSS_Sysargs *args);
@@ -138,8 +137,8 @@ void phase4_init(void) {
     diskQueue[i] = NULL;
     currTrackPos[i] = 0;
     int semId;
-    kernSemCreate(1, &semId); // Initial value 1 = unlocked
-    diskSemaphores[i] = semId;
+    kernSemCreate(1, &semId);
+    diskSemLocks[i] = semId;
   }
 }
 
@@ -298,6 +297,7 @@ void diskHandler(int type, void *arg) {
   MboxCondSend(diskInterruptMbox[unit], &status, sizeof(int));
 }
 
+// Handles all disk I/O for a unit by processing queue read and write requests
 int DiskDriver(void *arg) {
   int unit = (int)(long)arg;
   int status;
@@ -351,7 +351,7 @@ int DiskDriver(void *arg) {
             if (seekStatus != USLOSS_DEV_READY) {
               request->status = seekStatus;
               unblockProc(request->pid);
-              kernSemV(diskSemaphores[unit]);
+              kernSemV(diskSemLocks[unit]);
               free(request);
               continue;
             }
@@ -360,10 +360,10 @@ int DiskDriver(void *arg) {
 
           void *kernelBuf = malloc(toWrite * diskData[unit][0]);
           if (!kernelBuf) {
-            USLOSS_Console("DiskDriver(%d): malloc failed for WRITE\n", unit);
+            USLOSS_Console("Malloc failed for WRITE\n");
             request->status = -1;
             unblockProc(request->pid);
-            kernSemV(diskSemaphores[request->unit]);
+            kernSemV(diskSemLocks[request->unit]);
             free(request);
             continue;
           }
@@ -387,7 +387,7 @@ int DiskDriver(void *arg) {
         }
 
         request->status = status;
-        kernSemV(diskSemaphores[unit]);
+        kernSemV(diskSemLocks[unit]);
         unblockProc(request->pid);
         free(request);
         continue;
@@ -415,7 +415,7 @@ int DiskDriver(void *arg) {
             if (seekStatus != USLOSS_DEV_READY) {
               request->status = seekStatus;
               unblockProc(request->pid);
-              kernSemV(diskSemaphores[unit]);
+              kernSemV(diskSemLocks[unit]);
               free(request);
               continue;
             }
@@ -424,10 +424,10 @@ int DiskDriver(void *arg) {
 
           void *kernelBuf = malloc(toRead * diskData[unit][0]);
           if (!kernelBuf) {
-            USLOSS_Console("DiskDriver(%d): malloc failed for READ\n", unit);
+            USLOSS_Console("Malloc failed for READ\n", unit);
             request->status = -1;
             unblockProc(request->pid);
-            kernSemV(diskSemaphores[request->unit]);
+            kernSemV(diskSemLocks[request->unit]);
             free(request);
             continue;
           }
@@ -450,16 +450,13 @@ int DiskDriver(void *arg) {
         }
 
         request->status = status;
-        kernSemV(diskSemaphores[unit]);
+        kernSemV(diskSemLocks[unit]);
         unblockProc(request->pid);
         free(request);
         continue;
       }
-
-      USLOSS_Console("[ERROR] Unknown opType = %d in DiskDriver\n",
-                     request->opType);
       request->status = -1;
-      kernSemV(diskSemaphores[unit]);
+      kernSemV(diskSemLocks[unit]);
       unblockProc(request->pid);
       free(request);
     }
@@ -467,6 +464,8 @@ int DiskDriver(void *arg) {
   return 0;
 }
 
+// Handles all SYS_DISKSIZE calls and returns secrtor size, sectors left per
+// track and number of tracks for a disk unit
 void diskSizeHandler(USLOSS_Sysargs *args) {
   int unit = (int)(long)args->arg1;
 
@@ -486,6 +485,8 @@ void diskSizeHandler(USLOSS_Sysargs *args) {
   args->arg4 = (void *)(long)0;
 }
 
+// Handle the SYS_DISKREAD call enqueus a disk read request and blocks unitl
+// complete
 void diskReadHandler(USLOSS_Sysargs *args) {
   void *buffer = args->arg1;
   int sectors = (int)(long)args->arg2;
@@ -520,13 +521,15 @@ void diskReadHandler(USLOSS_Sysargs *args) {
 
   enqueueDiskRequest(request);
 
-  kernSemP(diskSemaphores[unit]);
+  kernSemP(diskSemLocks[unit]);
   blockMe();
 
   args->arg1 = (void *)(long)request->status;
   args->arg4 = (void *)(long)0;
 }
 
+// Handles SYS_WRITE calls and enqueues disk write requests and block unitl
+// complete
 void diskWriteHandler(USLOSS_Sysargs *args) {
   void *buffer = args->arg1;
   int sectors = (int)(long)args->arg2;
@@ -561,7 +564,7 @@ void diskWriteHandler(USLOSS_Sysargs *args) {
 
   enqueueDiskRequest(request);
 
-  kernSemP(diskSemaphores[unit]);
+  kernSemP(diskSemLocks[unit]);
   blockMe();
 
   args->arg1 = (void *)(long)request->status;
@@ -640,6 +643,8 @@ void enqueueDiskRequest(DiskRequest *request) {
   MboxSend(diskRequestMbox[unit], &dummy, sizeof(int));
 }
 
+// Removes and returns the head of the disk queue for the given
+// unit
 DiskRequest *dequeueDiskRequest(int unit) {
   DiskRequest *request = diskQueue[unit];
   if (request)
@@ -647,10 +652,10 @@ DiskRequest *dequeueDiskRequest(int unit) {
   return request;
 }
 
+// waits for a disk interrupt on a given unit and returns the status
 int awaitDiskInterrupt(int unit) {
   int status;
 
   int result = MboxRecv(diskInterruptMbox[unit], &status, sizeof(int));
   return (result == sizeof(int)) ? status : -1;
 }
-
