@@ -5,7 +5,7 @@
 #ifndef _PHASE4_H
 #define _PHASE4_H
 
-#define MAXLINE         80
+#define MAXLINE 80
 
 extern void phase4_init(void);
 
